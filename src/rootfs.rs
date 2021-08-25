@@ -28,6 +28,7 @@ pub fn prepare_rootfs(spec: &Spec, rootfs: &Path, bind_devices: bool) -> Result<
             "shared" => flags |= MsFlags::MS_SHARED,
             "private" => flags |= MsFlags::MS_PRIVATE,
             "slave" => flags |= MsFlags::MS_SLAVE,
+            "unbindable" => flags |= MsFlags::MS_UNBINDABLE,
             uknown => bail!("unknown rootfs_propagation: {}", uknown),
         }
     } else {
