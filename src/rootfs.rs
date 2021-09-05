@@ -26,23 +26,35 @@ pub fn prepare_rootfs(spec: &Spec, rootfs: &Path, bind_devices: bool) -> Result<
             "shared" => flags |= MsFlags::MS_SHARED,
             "private" => flags |= MsFlags::MS_PRIVATE,
             "slave" => flags |= MsFlags::MS_SLAVE,
+            "unbindable" => flags = MsFlags::MS_UNBINDABLE,
             uknown => bail!("unknown rootfs_propagation: {}", uknown),
         }
     } else {
         flags |= MsFlags::MS_SLAVE;
     }
 
+    log::debug!("mount root fs {:?} flags: {:?}", rootfs, flags);
     nix_mount(None::<&str>, "/", None::<&str>, flags, None::<&str>)
         .context("Failed to mount rootfs")?;
 
-    log::debug!("mount root fs {:?}", rootfs);
-    nix_mount::<Path, Path, str, str>(
+    if flags.intersects(MsFlags::MS_UNBINDABLE) {
+        let parent = rootfs.parent().unwrap();
+        log::debug!("mount rootfs parent: {:?}", parent);
+        let _ = nix_mount(
+            None::<&str>,
+            parent,
+            None::<&str>,
+            MsFlags::MS_PRIVATE,
+            None::<&str>,
+        );
+    }
+    let _ = nix_mount::<Path, Path, str, str>(
         Some(rootfs),
         rootfs,
-        None::<&str>,
+        Some("bind"),
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    )?;
+    );
 
     if let Some(mounts) = spec.mounts.as_ref() {
         for mount in mounts.iter() {
