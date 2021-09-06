@@ -183,7 +183,9 @@ where
                     panic!("{} is not a valid device path", dev.path.display());
                 }
 
-                bind_dev(rootfs, dev)
+                log::debug!("dev: {:?}", dev);
+                bind_dev(rootfs, dev)?;
+                mknod_dev(rootfs, dev)
             })
             .collect::<Result<Vec<_>>>()?;
     } else {
@@ -193,10 +195,12 @@ where
                     panic!("{} is not a valid device path", dev.path.display());
                 }
 
+                log::debug!("dev: {:?}", dev);
                 mknod_dev(rootfs, dev)
             })
             .collect::<Result<Vec<_>>>()?;
     }
+    //panic!("debug");
     umask(old_mode);
 
     Ok(())
@@ -210,6 +214,7 @@ fn bind_dev(rootfs: &Path, dev: &LinuxDevice) -> Result<()> {
         OFlag::O_RDWR | OFlag::O_CREAT,
         Mode::from_bits_truncate(0o644),
     )?;
+    log::debug!("debug full_container_path: {:?}", full_container_path);
     close(fd)?;
     nix_mount(
         Some(&full_container_path),
@@ -231,6 +236,7 @@ fn mknod_dev(rootfs: &Path, dev: &LinuxDevice) -> Result<()> {
     }
 
     let full_container_path = rootfs.join(dev.path.as_in_container()?);
+    log::debug!("full_container_path: {:?}", full_container_path);
     mknod(
         &full_container_path,
         dev.typ.to_sflag()?,
@@ -242,7 +248,7 @@ fn mknod_dev(rootfs: &Path, dev: &LinuxDevice) -> Result<()> {
         dev.uid.map(Uid::from_raw),
         dev.gid.map(Gid::from_raw),
     )?;
-
+    //panic!("now");
     Ok(())
 }
 
