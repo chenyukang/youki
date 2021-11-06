@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result};
 use cgroups;
 use oci_spec::Spec;
-use std::{fs, os::unix::prelude::RawFd, path::PathBuf};
+use std::{fs, io::Write, os::unix::prelude::RawFd, path::PathBuf};
 
 use super::{Container, ContainerStatus};
 
@@ -49,11 +49,10 @@ impl<'a> ContainerBuilderImpl<'a> {
     }
 
     fn run_container(&mut self) -> Result<()> {
-        prctl::set_dumpable(false).unwrap();
-
         let linux = self.spec.linux.as_ref().context("no linux in spec")?;
         let cgroups_path = utils::get_cgroup_path(&linux.cgroups_path, &self.container_id);
         let cmanager = cgroups::common::create_cgroup_manager(&cgroups_path, self.use_systemd)?;
+        let process = self.spec.process.as_ref().context("No process in spec")?;
 
         if self.init {
             if let Some(hooks) = self.spec.hooks.as_ref() {
@@ -62,14 +61,41 @@ impl<'a> ContainerBuilderImpl<'a> {
         }
 
         // We use a set of channels to communicate between parent and child process. Each channel is uni-directional.
-        let parent_to_child = &mut channel::Channel::new()?;
-        let child_to_parent = &mut channel::Channel::new()?;
+        let (sender_to_intermediate, receiver_from_main) = &mut channel::main_to_intermediate()?;
+        let (sender_to_main, receiver_from_intermediate) = &mut channel::intermediate_to_main()?;
 
         // Need to create the notify socket before we pivot root, since the unix
         // domain socket used here is outside of the rootfs of container. During
         // exec, need to create the socket before we exter into existing mount
         // namespace.
         let notify_socket: NotifyListener = NotifyListener::new(&self.notify_path)?;
+
+        // If Out-of-memory score adjustment is set in specification.  set the score
+        // value for the current process check
+        // https://dev.to/rrampage/surviving-the-linux-oom-killer-2ki9 for some more
+        // information.
+        //
+        // This has to be done before !dumpable because /proc/self/oom_score_adj
+        // is not writeable unless you're an privileged user (if !dumpable is
+        // set). All children inherit their parent's oom_score_adj value on
+        // fork(2) so this will always be propagated properly.
+        if let Some(oom_score_adj) = process.oom_score_adj {
+            log::debug!("Set OOM score to {}", oom_score_adj);
+            let mut f = fs::File::create("/proc/self/oom_score_adj")?;
+            f.write_all(oom_score_adj.to_string().as_bytes())?;
+        }
+
+        // Make the process non-dumpable, to avoid various race conditions that
+        // could cause processes in namespaces we're joining to access host
+        // resources (or potentially execute code).
+        //
+        // However, if the number of namespaces we are joining is 0, we are not
+        // going to be switching to a different security context. Thus setting
+        // ourselves to be non-dumpable only breaks things (like rootless
+        // containers), which is the recommendation from the kernel folks.
+        if linux.namespaces.is_some() {
+            prctl::set_dumpable(false).unwrap();
+        }
 
         // This init_args will be passed to the container init process,
         // therefore we will have to move all the variable by value. Since self
@@ -85,21 +111,39 @@ impl<'a> ContainerBuilderImpl<'a> {
             container: self.container.clone(),
         };
         let intermediate_pid = fork::container_fork(|| {
-            init::container_intermidiate(init_args, parent_to_child, child_to_parent)
+            // The fds in the pipe is duplicated during fork, so we first close
+            // the unused fds. Note, this already runs in the child process.
+            sender_to_intermediate
+                .close()
+                .context("Failed to close unused sender")?;
+            receiver_from_intermediate
+                .close()
+                .context("Failed to close unused receiver")?;
+
+            init::container_intermidiate(init_args, receiver_from_main, sender_to_main)
         })?;
+        // Close down unused fds. The corresponding fds are duplicated to the
+        // child process during fork.
+        receiver_from_main
+            .close()
+            .context("Failed to close parent to child receiver")?;
+        sender_to_main
+            .close()
+            .context("Failed to close child to parent sender")?;
+
         // If creating a rootless container, the intermediate process will ask
         // the main process to set up uid and gid mapping, once the intermediate
         // process enters into a new user namespace.
         if self.rootless.is_some() {
-            child_to_parent.wait_for_mapping_request()?;
+            receiver_from_intermediate.wait_for_mapping_request()?;
             log::debug!("write mapping for pid {:?}", intermediate_pid);
             utils::write_file(format!("/proc/{}/setgroups", intermediate_pid), "deny")?;
             rootless::write_uid_mapping(intermediate_pid, self.rootless.as_ref())?;
             rootless::write_gid_mapping(intermediate_pid, self.rootless.as_ref())?;
-            parent_to_child.send_mapping_written()?;
+            sender_to_intermediate.mapping_written()?;
         }
 
-        let init_pid = child_to_parent.wait_for_child_ready()?;
+        let init_pid = receiver_from_intermediate.wait_for_intermediate_ready()?;
         log::debug!("init pid is {:?}", init_pid);
 
         cmanager
